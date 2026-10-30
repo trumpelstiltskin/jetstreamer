@@ -3479,17 +3479,16 @@ fn convert_proto_rewards(
     let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
     for proto_reward in proto_rewards.rewards.iter() {
         let reward = StakeRewardInfo {
-            reward_type: match proto_reward.reward_type - 1 {
-                0 => RewardType::Fee,
-                1 => RewardType::Rent,
-                2 => RewardType::Staking,
-                3 => RewardType::Voting,
-                4 => RewardType::DeactivatedStake,
+            reward_type: match proto_reward.reward_type {
+                1 => RewardType::Fee,
+                2 => RewardType::Rent,
+                3 => RewardType::Staking,
+                4 => RewardType::Voting,
+                5 => RewardType::DeactivatedStake,
                 typ => {
-                    return Err(Box::new(std::io::Error::other(format!(
-                        "unsupported reward type {}",
-                        typ
-                    ))));
+                    // New protocol rewards must not prevent transaction/block replay.
+                    log::warn!(target: LOG_MODULE, "Skipping unsupported protobuf reward type {typ}");
+                    continue;
                 }
             },
             lamports: proto_reward.lamports,
@@ -4778,4 +4777,78 @@ async fn test_firehose_reverse_implies_sequential() {
         "reverse should imply sequential and emit highest epoch first; first slot was {}",
         observed[0],
     );
+}
+
+#[cfg(test)]
+mod rewards_compatibility_tests {
+    use super::*;
+    use solana_storage_proto::convert::generated::{NumPartitions, Reward, Rewards};
+
+    fn proto_reward(reward_type: i32) -> Reward {
+        Reward {
+            pubkey: Address::from([1; 32]).to_string(),
+            lamports: 42,
+            post_balance: 1000,
+            reward_type,
+            commission: "7".into(),
+            commission_bps: "125".into(),
+        }
+    }
+
+    #[test]
+    fn unknown_rewards_do_not_discard_known_rewards_or_partitions() {
+        let proto = Rewards {
+            rewards: [1, 6, 2, 7, 3, 255, 4, 5]
+                .into_iter()
+                .map(proto_reward)
+                .collect(),
+            num_partitions: Some(NumPartitions { num_partitions: 7 }),
+        };
+        let decoded =
+            convert_proto_rewards(&proto).expect("new reward types must not abort a block");
+        assert_eq!(decoded.num_partitions, Some(7));
+        assert_eq!(decoded.keyed_rewards.len(), 5);
+        let expected = [
+            RewardType::Fee,
+            RewardType::Rent,
+            RewardType::Staking,
+            RewardType::Voting,
+            RewardType::DeactivatedStake,
+        ];
+        for ((address, reward), expected_type) in decoded.keyed_rewards.iter().zip(expected) {
+            assert_eq!(*address, Address::from([1; 32]));
+            assert_eq!(reward.reward_type, expected_type);
+            assert_eq!(reward.lamports, 42);
+            assert_eq!(reward.post_balance, 1000);
+            assert_eq!(reward.commission_bps, Some(125));
+        }
+    }
+
+    #[test]
+    fn all_unknown_rewards_decode_as_an_empty_list() {
+        let proto = Rewards {
+            rewards: [0, 6, 7, i32::MAX, i32::MIN]
+                .into_iter()
+                .map(proto_reward)
+                .collect(),
+            num_partitions: None,
+        };
+        let decoded =
+            convert_proto_rewards(&proto).expect("unused unknown rewards must be skippable");
+        assert!(decoded.keyed_rewards.is_empty());
+        assert_eq!(decoded.num_partitions, None);
+    }
+
+    #[test]
+    fn invalid_known_reward_address_still_fails() {
+        let mut reward = proto_reward(1);
+        reward.pubkey = "invalid".into();
+        assert!(
+            convert_proto_rewards(&Rewards {
+                rewards: vec![reward],
+                num_partitions: None
+            })
+            .is_err()
+        );
+    }
 }
